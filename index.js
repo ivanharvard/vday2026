@@ -54,6 +54,15 @@
 
         this.playCount = 0;
 
+        this.ending = {
+            active: false,
+            phase: null,
+            timer: 0,
+            flowerHit: false,
+            obstaclesCleared: false,
+            lockControls: false
+        };
+
         // Sound FX.
         this.audioBuffer = null;
         this.soundFx = {};
@@ -64,6 +73,7 @@
         // Images.
         this.images = {};
         this.imagesLoaded = 0;
+        Runner.endingAssets = {};
 
         if (this.isDisabled()) {
             this.setupDisabledRunner();
@@ -99,6 +109,14 @@
     var IS_TOUCH_ENABLED = 'ontouchstart' in window;
 
     /**
+     * Debug: Set to a number to trigger ending sequence at that score.
+     * Set to false to use default values. Very useful for testing!
+     * Example: var DEBUG_ENDING_DISTANCE = 20; (makes ending start at score 20)
+     * @const
+     */
+    var DEBUG_ENDING_DISTANCE = false;
+
+    /**
      * Default game configuration.
      * @enum {number}
      */
@@ -108,6 +126,24 @@
         BOTTOM_PAD: 10,
         CLEAR_TIME: 3000,
         CLOUD_FREQUENCY: 0.5,
+        ENDING_DISTANCE: DEBUG_ENDING_DISTANCE || 500,
+        FLOWER_DISTANCE: (DEBUG_ENDING_DISTANCE || 500) + 30,
+        WALK_SPEED: 2,
+        WALK_DECELERATION: 0.002,
+        FLOWER_WAIT_MS: 1000,
+        HEART_DELAY_MS: 1000,
+        ENDING_SCORE_RATE: 4,
+        ENDING_ASSETS: {
+            FLOWER_SRC: 'assets/flower.png',
+            SMILE_SRC: 'assets/trex-smile.png',
+            HEART_SRC: 'assets/heart.png',
+            FLOWER_WIDTH: 16,
+            FLOWER_HEIGHT: 26,
+            SMILE_WIDTH: 44,
+            SMILE_HEIGHT: 47,
+            HEART_WIDTH: 20,
+            HEART_HEIGHT: 18
+        },
         GAMEOVER_CLEAR_TIME: 750,
         GAP_COEFFICIENT: 0.6,
         GRAVITY: 0.6,
@@ -304,6 +340,24 @@
                 Runner.imageSprite.addEventListener(Runner.events.LOAD,
                     this.init.bind(this));
             }
+
+            this.loadEndingAssets();
+        },
+
+        loadEndingAssets: function () {
+            var assets = this.config.ENDING_ASSETS;
+            if (!assets) {
+                return;
+            }
+
+            Runner.endingAssets.flower = new Image();
+            Runner.endingAssets.flower.src = assets.FLOWER_SRC;
+
+            Runner.endingAssets.smile = new Image();
+            Runner.endingAssets.smile.src = assets.SMILE_SRC;
+
+            Runner.endingAssets.heart = new Image();
+            Runner.endingAssets.heart.src = assets.HEART_SRC;
         },
 
         /**
@@ -534,6 +588,10 @@
             var now = getTimeStamp();
             var deltaTime = now - (this.time || now);
             this.time = now;
+            
+            // Clamp deltaTime to prevent large jumps when window refocuses
+            // (after tab switch/alt-tab, deltaTime can be several seconds)
+            deltaTime = Math.min(deltaTime, 50);
 
             if (this.playing) {
                 this.clearCanvas();
@@ -544,6 +602,17 @@
 
                 this.runningTime += deltaTime;
                 var hasObstacles = this.runningTime > this.config.CLEAR_TIME;
+                var displayDistance = this.distanceMeter.getActualDistance(
+                    Math.ceil(this.distanceRan));
+
+                if (!this.ending.active && displayDistance >= this.config.ENDING_DISTANCE) {
+                    this.startEndingSequence();
+                }
+
+                if (this.ending.active) {
+                    this.updateEndingSequence(deltaTime, displayDistance);
+                    hasObstacles = false;
+                }
 
                 // First jump triggers the intro.
                 if (this.tRex.jumpCount == 1 && !this.playingIntro) {
@@ -551,23 +620,36 @@
                 }
 
                 // The horizon doesn't move until the intro is over.
+                var horizonDeltaTime = deltaTime;
+                var horizonSpeed = this.currentSpeed;
+                var horizonObstacles = hasObstacles;
+
+                if (this.ending.active && this.ending.phase != 'walk') {
+                    horizonDeltaTime = 0;
+                    horizonSpeed = 0;
+                    horizonObstacles = false;
+                }
+
                 if (this.playingIntro) {
-                    this.horizon.update(0, this.currentSpeed, hasObstacles);
+                    this.horizon.update(0, horizonSpeed, horizonObstacles,
+                        this.inverted, displayDistance);
                 } else {
-                    deltaTime = !this.activated ? 0 : deltaTime;
-                    this.horizon.update(deltaTime, this.currentSpeed, hasObstacles,
-                        this.inverted);
+                    horizonDeltaTime = !this.activated ? 0 : horizonDeltaTime;
+                    this.horizon.update(horizonDeltaTime, horizonSpeed, horizonObstacles,
+                        this.inverted, displayDistance);
                 }
 
                 // Check for collisions.
-                var collision = hasObstacles &&
+                var collision = hasObstacles && !this.ending.active &&
                     checkForCollision(this.horizon.obstacles[0], this.tRex);
 
                 if (!collision) {
-                    this.distanceRan += this.currentSpeed * deltaTime / this.msPerFrame;
+                    if (!this.ending.active || this.ending.phase == 'walk') {
+                        this.distanceRan += this.currentSpeed * deltaTime / this.msPerFrame;
 
-                    if (this.currentSpeed < this.config.MAX_SPEED) {
-                        this.currentSpeed += this.config.ACCELERATION;
+                        if (this.currentSpeed < this.config.MAX_SPEED) {
+                            this.currentSpeed += this.config.ACCELERATION;
+                        }
                     }
                 } else {
                     this.gameOver();
@@ -581,23 +663,25 @@
                 }
 
                 // Night mode.
-                if (this.invertTimer > this.config.INVERT_FADE_DURATION) {
-                    this.invertTimer = 0;
-                    this.invertTrigger = false;
-                    this.invert();
-                } else if (this.invertTimer) {
-                    this.invertTimer += deltaTime;
-                } else {
-                    var actualDistance =
-                        this.distanceMeter.getActualDistance(Math.ceil(this.distanceRan));
+                if (!this.ending.active) {
+                    if (this.invertTimer > this.config.INVERT_FADE_DURATION) {
+                        this.invertTimer = 0;
+                        this.invertTrigger = false;
+                        this.invert();
+                    } else if (this.invertTimer) {
+                        this.invertTimer += deltaTime;
+                    } else {
+                        var actualDistance =
+                            this.distanceMeter.getActualDistance(Math.ceil(this.distanceRan));
 
-                    if (actualDistance > 0) {
-                        this.invertTrigger = !(actualDistance %
-                            this.config.INVERT_DISTANCE);
+                        if (actualDistance > 0) {
+                            this.invertTrigger = !(actualDistance %
+                                this.config.INVERT_DISTANCE);
 
-                        if (this.invertTrigger && this.invertTimer === 0) {
-                            this.invertTimer += deltaTime;
-                            this.invert();
+                            if (this.invertTrigger && this.invertTimer === 0) {
+                                this.invertTimer += deltaTime;
+                                this.invert();
+                            }
                         }
                     }
                 }
@@ -606,8 +690,97 @@
             if (this.playing || (!this.activated &&
                 this.tRex.blinkCount < Runner.config.MAX_BLINK_COUNT)) {
                 this.tRex.update(deltaTime);
+                if (this.ending.active && this.ending.phase == 'heart') {
+                    this.drawHeart();
+                }
                 this.scheduleNextUpdate();
             }
+        },
+
+        startEndingSequence: function () {
+            this.ending.active = true;
+            this.ending.phase = 'walk';
+            this.ending.timer = 0;
+            this.ending.flowerHit = false;
+            this.ending.obstaclesCleared = false;
+            this.ending.lockControls = true;
+        },
+
+        updateEndingSequence: function (deltaTime, displayDistance) {
+            if (!this.ending.obstaclesCleared) {
+                this.horizon.clearObstacles();
+                this.ending.obstaclesCleared = true;
+            }
+
+            if (this.currentSpeed > this.config.WALK_SPEED) {
+                this.currentSpeed = Math.max(this.config.WALK_SPEED,
+                    this.currentSpeed - (this.config.WALK_DECELERATION * deltaTime));
+            }
+
+            if (displayDistance >= this.config.FLOWER_DISTANCE &&
+                this.currentSpeed <= this.config.WALK_SPEED &&
+                !this.horizon.flowerSpawned) {
+                this.horizon.spawnFlower();
+            }
+
+            if (this.horizon.flower && !this.ending.flowerHit) {
+                var tRexBox = new CollisionBox(
+                    this.tRex.xPos + 1,
+                    this.tRex.yPos + 1,
+                    this.tRex.config.WIDTH - 2,
+                    this.tRex.config.HEIGHT - 2);
+                var flowerBox = this.horizon.flower.getCollisionBox();
+
+                if (boxCompare(tRexBox, flowerBox)) {
+                    this.ending.flowerHit = true;
+                    this.ending.phase = 'pause';
+                    this.ending.timer = 0;
+                    this.currentSpeed = 0;
+                    // Go straight to SMILING to avoid the WAITING animation showing
+                    this.tRex.update(0, Trex.status.SMILING);
+                }
+            }
+
+            if (this.ending.flowerHit) {
+                this.ending.timer += deltaTime;
+
+                if (this.ending.phase == 'pause' &&
+                    this.ending.timer >= this.config.FLOWER_WAIT_MS) {
+                    this.ending.phase = 'smile';
+                    this.ending.timer = 0;
+                    this.tRex.update(0, Trex.status.SMILING);
+                } else if (this.ending.phase == 'smile' &&
+                    this.ending.timer >= this.config.HEART_DELAY_MS) {
+                    this.ending.phase = 'heart';
+                    this.ending.timer = 0;
+                } else if (this.ending.phase == 'heart') {
+                    var scoreIncrement = (this.config.ENDING_SCORE_RATE /
+                        DistanceMeter.config.COEFFICIENT) * (deltaTime / 1000);
+                    this.distanceRan += scoreIncrement;
+                }
+            }
+        },
+
+        drawHeart: function () {
+            var x = this.tRex.xPos + this.tRex.config.WIDTH + 10;
+            var y = this.tRex.yPos - 6;
+            var assets = this.config.ENDING_ASSETS;
+            var heartImage = Runner.endingAssets && Runner.endingAssets.heart;
+
+            if (heartImage && heartImage.complete && assets) {
+                this.canvasCtx.drawImage(heartImage, x, y,
+                    assets.HEART_WIDTH, assets.HEART_HEIGHT);
+                return;
+            }
+
+            this.canvasCtx.save();
+            this.canvasCtx.fillStyle = '#e25555';
+            this.canvasCtx.beginPath();
+            this.canvasCtx.moveTo(x, y);
+            this.canvasCtx.bezierCurveTo(x - 6, y - 6, x - 16, y + 2, x, y + 14);
+            this.canvasCtx.bezierCurveTo(x + 16, y + 2, x + 6, y - 6, x, y);
+            this.canvasCtx.fill();
+            this.canvasCtx.restore();
         },
 
         /**
@@ -672,6 +845,10 @@
          * @param {Event} e
          */
         onKeyDown: function (e) {
+            if (this.ending && this.ending.lockControls) {
+                e.preventDefault();
+                return;
+            }
             // Prevent native page scrolling whilst tapping on mobile.
             if (IS_MOBILE && this.playing) {
                 e.preventDefault();
@@ -719,6 +896,10 @@
          * @param {Event} e
          */
         onKeyUp: function (e) {
+            if (this.ending && this.ending.lockControls) {
+                e.preventDefault();
+                return;
+            }
             var keyCode = String(e.keyCode);
             var isjumpKey = Runner.keycodes.JUMP[keyCode] ||
                 e.type == Runner.events.TOUCHEND ||
@@ -836,6 +1017,12 @@
                 this.clearCanvas();
                 this.distanceMeter.reset(this.highestScore);
                 this.horizon.reset();
+                this.ending.active = false;
+                this.ending.phase = null;
+                this.ending.timer = 0;
+                this.ending.flowerHit = false;
+                this.ending.obstaclesCleared = false;
+                this.ending.lockControls = false;
                 this.tRex.reset();
                 this.playSound(this.soundFx.BUTTON_PRESS);
                 this.invert(true);
@@ -1604,6 +1791,7 @@
         DUCKING: 'DUCKING',
         JUMPING: 'JUMPING',
         RUNNING: 'RUNNING',
+        SMILING: 'SMILING',
         WAITING: 'WAITING'
     };
 
@@ -1638,6 +1826,10 @@
         DUCKING: {
             frames: [264, 323],
             msPerFrame: 1000 / 8
+        },
+        SMILING: {
+            frames: [0],
+            msPerFrame: 1000 / 60
         }
     };
 
@@ -1695,12 +1887,14 @@
 
             if (this.status == Trex.status.WAITING) {
                 this.blink(getTimeStamp());
+            } else if (this.status == Trex.status.SMILING) {
+                this.draw(0, 0);
             } else {
                 this.draw(this.currentAnimFrames[this.currentFrame], 0);
             }
 
-            // Update the frame position.
-            if (this.timer >= this.msPerFrame) {
+            // Update the frame position (but not if smiling).
+            if (this.timer >= this.msPerFrame && this.status != Trex.status.SMILING) {
                 this.currentFrame = this.currentFrame ==
                     this.currentAnimFrames.length - 1 ? 0 : this.currentFrame + 1;
                 this.timer = 0;
@@ -1719,6 +1913,26 @@
          * @param {number} y
          */
         draw: function (x, y) {
+            // If smiling, draw smile and skip the base sprite entirely
+            if (this.status == Trex.status.SMILING) {
+                var assets = Runner.config.ENDING_ASSETS;
+                var smileImage = Runner.endingAssets && Runner.endingAssets.smile;
+
+                if (smileImage && smileImage.complete && assets) {
+                    this.canvasCtx.drawImage(smileImage, this.xPos, this.yPos,
+                        assets.SMILE_WIDTH, assets.SMILE_HEIGHT);
+                } else {
+                    this.canvasCtx.save();
+                    this.canvasCtx.strokeStyle = '#222';
+                    this.canvasCtx.lineWidth = 2;
+                    this.canvasCtx.beginPath();
+                    this.canvasCtx.arc(this.xPos + 28, this.yPos + 18, 6, 0, Math.PI);
+                    this.canvasCtx.stroke();
+                    this.canvasCtx.restore();
+                }
+                return;
+            }
+
             var sourceX = x;
             var sourceY = y;
             var sourceWidth = this.ducking && this.status != Trex.status.CRASHED ?
@@ -2526,6 +2740,184 @@
     //******************************************************************************
 
     /**
+     * Background text manager.
+     * @param {HTMLCanvasElement} canvas
+     * @param {Object} dimensions Canvas dimensions.
+     * @param {Object} config Text config.
+     * @constructor
+     */
+    function BackgroundTextManager(canvas, dimensions, config) {
+        this.canvas = canvas;
+        this.canvasCtx = canvas.getContext('2d');
+        this.dimensions = dimensions;
+        this.config = config;
+        this.activeMessages = [];
+        this.nextIndex = 0;
+    }
+
+    BackgroundTextManager.prototype = {
+        reset: function () {
+            this.activeMessages = [];
+            this.nextIndex = 0;
+        },
+
+        update: function (deltaTime, speed, distance) {
+            if (!this.config || !this.config.MESSAGES || !this.config.MESSAGES.length) {
+                return;
+            }
+
+            if (distance == null) {
+                return;
+            }
+
+            while (this.nextIndex < this.config.MESSAGES.length &&
+                distance >= this.config.MESSAGES[this.nextIndex].distance) {
+                this.spawnMessage(this.config.MESSAGES[this.nextIndex]);
+                this.nextIndex++;
+            }
+
+            var increment = Math.floor(speed * (FPS / 1000) * deltaTime *
+                this.config.SPEED_MULT);
+
+            if (this.activeMessages.length) {
+                for (var i = this.activeMessages.length - 1; i >= 0; i--) {
+                    this.activeMessages[i].xPos -= increment;
+
+                    if (this.activeMessages[i].xPos < -this.activeMessages[i].width) {
+                        this.activeMessages.splice(i, 1);
+                    }
+                }
+            }
+
+            this.draw();
+        },
+
+        spawnMessage: function (message) {
+            var yPos = Math.round(this.dimensions.HEIGHT * this.config.Y_POS_RATIO);
+            var width = this.measureTextWidth(message.text);
+
+            this.activeMessages.push({
+                text: message.text,
+                xPos: this.dimensions.WIDTH + this.config.START_OFFSET,
+                yPos: yPos,
+                width: width
+            });
+        },
+
+        measureTextWidth: function (text) {
+            this.canvasCtx.save();
+            this.canvasCtx.font = this.config.FONT;
+            var width = this.canvasCtx.measureText(text).width;
+            this.canvasCtx.restore();
+            return width;
+        },
+
+        draw: function () {
+            if (!this.activeMessages.length) {
+                return;
+            }
+
+            this.canvasCtx.save();
+            this.canvasCtx.font = this.config.FONT;
+            this.canvasCtx.fillStyle = this.config.COLOR;
+            this.canvasCtx.globalAlpha = this.config.ALPHA;
+            this.canvasCtx.textBaseline = 'top';
+
+            for (var i = 0; i < this.activeMessages.length; i++) {
+                var message = this.activeMessages[i];
+                this.canvasCtx.fillText(message.text, Math.round(message.xPos),
+                    message.yPos);
+            }
+
+            this.canvasCtx.restore();
+        }
+    };
+
+
+    //******************************************************************************
+
+    /**
+     * Flower placeholder for ending sequence.
+     * @param {HTMLCanvasElement} canvas
+     * @param {Object} dimensions Canvas dimensions.
+     * @param {Object} config Flower config.
+     * @constructor
+     */
+    function Flower(canvas, dimensions, config) {
+        this.canvas = canvas;
+        this.canvasCtx = canvas.getContext('2d');
+        this.dimensions = dimensions;
+        this.config = config;
+        this.width = config.WIDTH;
+        this.height = config.HEIGHT;
+        this.xPos = dimensions.WIDTH + config.START_OFFSET;
+        // Position flower on ground using actual drawn height from assets
+        var assets = Runner.config.ENDING_ASSETS;
+        var flowerHeight = assets ? assets.FLOWER_HEIGHT : this.height;
+        this.yPos = Math.round(dimensions.HEIGHT - Runner.config.BOTTOM_PAD -
+            flowerHeight);
+        this.remove = false;
+    }
+
+    Flower.prototype = {
+        update: function (deltaTime, speed) {
+            this.xPos -= Math.floor((speed * FPS / 1000) * deltaTime);
+            this.draw();
+
+            if (this.xPos + this.width < 0) {
+                this.remove = true;
+            }
+        },
+
+        draw: function () {
+            var flowerImage = Runner.endingAssets && Runner.endingAssets.flower;
+            var assets = Runner.config.ENDING_ASSETS;
+
+            if (flowerImage && flowerImage.complete && assets) {
+                this.canvasCtx.drawImage(flowerImage, this.xPos, this.yPos,
+                    assets.FLOWER_WIDTH, assets.FLOWER_HEIGHT);
+                return;
+            }
+
+            var centerX = this.xPos + Math.round(this.width / 2);
+            var centerY = this.yPos + 6;
+
+            this.canvasCtx.save();
+            this.canvasCtx.strokeStyle = this.config.STEM_COLOR;
+            this.canvasCtx.lineWidth = 2;
+            this.canvasCtx.beginPath();
+            this.canvasCtx.moveTo(centerX, this.yPos + this.height);
+            this.canvasCtx.lineTo(centerX, centerY + 4);
+            this.canvasCtx.stroke();
+
+            this.canvasCtx.fillStyle = this.config.PETAL_COLOR;
+            this.canvasCtx.beginPath();
+            this.canvasCtx.arc(centerX - 4, centerY, 3, 0, Math.PI * 2);
+            this.canvasCtx.arc(centerX + 4, centerY, 3, 0, Math.PI * 2);
+            this.canvasCtx.arc(centerX, centerY - 4, 3, 0, Math.PI * 2);
+            this.canvasCtx.arc(centerX, centerY + 4, 3, 0, Math.PI * 2);
+            this.canvasCtx.fill();
+
+            this.canvasCtx.fillStyle = this.config.CENTER_COLOR;
+            this.canvasCtx.beginPath();
+            this.canvasCtx.arc(centerX, centerY, 3, 0, Math.PI * 2);
+            this.canvasCtx.fill();
+            this.canvasCtx.restore();
+        },
+
+        getCollisionBox: function () {
+            return new CollisionBox(
+                this.xPos + 2,
+                this.yPos + 2,
+                this.width - 4,
+                this.height - 4);
+        }
+    };
+
+
+    //******************************************************************************
+
+    /**
      * Horizon background class.
      * @param {HTMLCanvasElement} canvas
      * @param {Object} spritePos Sprite positioning.
@@ -2552,6 +2944,9 @@
 
         // Horizon
         this.horizonLine = null;
+        this.flower = null;
+        this.flowerSpawned = false;
+        this.forcedObstacleIndex = 0;
         this.init();
     };
 
@@ -2565,7 +2960,39 @@
         BUMPY_THRESHOLD: .3,
         CLOUD_FREQUENCY: .5,
         HORIZON_HEIGHT: 16,
-        MAX_CLOUDS: 6
+        MAX_CLOUDS: 6,
+        FORCED_OBSTACLES: [
+            { distance: 310, type: 'CACTUS_LARGE' }
+        ],
+        FLOWER: {
+            WIDTH: 16,
+            HEIGHT: 16,
+            START_OFFSET: 80,
+            STEM_COLOR: '#3b7c3b',
+            PETAL_COLOR: '#f4a5c5',
+            CENTER_COLOR: '#f2d25c'
+        },
+        BACKGROUND_TEXT: {
+            MESSAGES: [
+                { distance: 40, text: 'HI ZOE' },
+                { distance: 80, text: 'KEEP GOING' },
+                { distance: 120, text: 'YOU GOT THIS' },
+                { distance: 160, text: 'HEY BTW' },
+                { distance: 200, text: 'I MADE THIS FOR YOU' },
+                { distance: 240, text: 'I HOPE YOU LIKE IT' },
+                { distance: 300, text: 'YOU MAKE MY DAY BETTER EVERYDAY '},
+                { distance: 340, text: 'I LOVE YOU TO THE MOON AND BACK' },
+                { distance: 380, text: 'I HAVE JUST ONE MORE THING TO SAY' },
+                { distance: 420, text: 'WILL YOU BE MY VALENTINE? (JUMP FOR YES)' },
+                { distance: 460, text: 'YAY! I LOVE YOU ZOE!' },
+            ],
+            SPEED_MULT: 0.6,
+            START_OFFSET: 20,
+            Y_POS_RATIO: 0.18,
+            FONT: '16px "Open Sans", sans-serif',
+            COLOR: '#b7b7b7',
+            ALPHA: 0.85
+        }
     };
 
 
@@ -2578,6 +3005,8 @@
             this.horizonLine = new HorizonLine(this.canvas, this.spritePos.HORIZON);
             this.nightMode = new NightMode(this.canvas, this.spritePos.MOON,
                 this.dimensions.WIDTH);
+            this.backgroundText = new BackgroundTextManager(this.canvas,
+                this.dimensions, this.config.BACKGROUND_TEXT);
         },
 
         /**
@@ -2588,15 +3017,59 @@
          *     ease in section.
          * @param {boolean} showNightMode Night mode activated.
          */
-        update: function (deltaTime, currentSpeed, updateObstacles, showNightMode) {
+        update: function (deltaTime, currentSpeed, updateObstacles, showNightMode,
+            opt_distance) {
             this.runningTime += deltaTime;
             this.horizonLine.update(deltaTime, currentSpeed);
             this.nightMode.update(showNightMode);
             this.updateClouds(deltaTime, currentSpeed);
+            this.backgroundText.update(deltaTime, currentSpeed, opt_distance);
+            this.updateFlower(deltaTime, currentSpeed);
 
             if (updateObstacles) {
+                this.updateForcedObstacles(opt_distance, currentSpeed);
                 this.updateObstacles(deltaTime, currentSpeed);
             }
+        },
+
+        updateForcedObstacles: function (distance, currentSpeed) {
+            if (!this.config.FORCED_OBSTACLES || distance == null) {
+                return;
+            }
+
+            while (this.forcedObstacleIndex < this.config.FORCED_OBSTACLES.length &&
+                distance >= this.config.FORCED_OBSTACLES[this.forcedObstacleIndex].distance) {
+                var forced = this.config.FORCED_OBSTACLES[this.forcedObstacleIndex];
+                this.addObstacleByType(forced.type, currentSpeed);
+                this.forcedObstacleIndex++;
+            }
+        },
+
+        spawnFlower: function () {
+            if (this.flowerSpawned) {
+                return;
+            }
+
+            this.flower = new Flower(this.canvas, this.dimensions,
+                this.config.FLOWER);
+            this.flowerSpawned = true;
+        },
+
+        updateFlower: function (deltaTime, currentSpeed) {
+            if (!this.flower) {
+                return;
+            }
+
+            this.flower.update(deltaTime, currentSpeed);
+
+            if (this.flower.remove) {
+                this.flower = null;
+            }
+        },
+
+        clearObstacles: function () {
+            this.obstacles = [];
+            this.obstacleHistory = [];
         },
 
         /**
@@ -2699,6 +3172,33 @@
             }
         },
 
+        addObstacleByType: function (typeName, currentSpeed) {
+            var obstacleType = null;
+
+            for (var i = 0; i < Obstacle.types.length; i++) {
+                if (Obstacle.types[i].type === typeName) {
+                    obstacleType = Obstacle.types[i];
+                    break;
+                }
+            }
+
+            if (!obstacleType) {
+                return;
+            }
+
+            var obstacleSpritePos = this.spritePos[obstacleType.type];
+
+            this.obstacles.push(new Obstacle(this.canvasCtx, obstacleType,
+                obstacleSpritePos, this.dimensions,
+                this.gapCoefficient, currentSpeed, obstacleType.width));
+
+            this.obstacleHistory.unshift(obstacleType.type);
+
+            if (this.obstacleHistory.length > 1) {
+                this.obstacleHistory.splice(Runner.config.MAX_OBSTACLE_DUPLICATION);
+            }
+        },
+
         /**
          * Returns whether the previous two obstacles are the same as the next one.
          * Maximum duplication is set in config value MAX_OBSTACLE_DUPLICATION.
@@ -2722,6 +3222,10 @@
             this.obstacles = [];
             this.horizonLine.reset();
             this.nightMode.reset();
+            this.backgroundText.reset();
+            this.forcedObstacleIndex = 0;
+            this.flower = null;
+            this.flowerSpawned = false;
         },
 
         /**
