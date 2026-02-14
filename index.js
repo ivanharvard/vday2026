@@ -134,9 +134,9 @@
         HEART_DELAY_MS: 1000,
         ENDING_SCORE_RATE: 4,
         ENDING_ASSETS: {
-            FLOWER_SRC: 'assets/flower.png',
-            SMILE_SRC: 'assets/trex-smile.png',
-            HEART_SRC: 'assets/heart.png',
+            FLOWER_SRC: '/vday2026/assets/flower.png',
+            SMILE_SRC: '/vday2026/assets/trex-smile.png',
+            HEART_SRC: '/vday2026/assets/heart.png',
             FLOWER_WIDTH: 16,
             FLOWER_HEIGHT: 26,
             SMILE_WIDTH: 44,
